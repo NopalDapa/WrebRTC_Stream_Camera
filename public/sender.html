@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LAN WebRTC Sender</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="page">
+      <h1>WebRTC Sender</h1>
+      <div class="card">
+        <div class="row">
+          <div class="pill" id="status">Idle</div>
+          <div class="pill" id="shareInfo"></div>
+        </div>
+        <div class="grid">
+          <video class="preview" autoplay playsinline muted></video>
+          <video class="preview" autoplay playsinline muted></video>
+          <video class="preview" autoplay playsinline muted></video>
+          <video class="preview" autoplay playsinline muted></video>
+        </div>
+        <div class="info">
+          Buka halaman viewer dari perangkat lain yang masih satu jaringan: http://&lt;IP-perangkat-ini&gt;:3000/viewer.html
+        </div>
+      </div>
+    </div>
+    <script>
+      const statusEl = document.getElementById("status");
+      const shareInfoEl = document.getElementById("shareInfo");
+      const previewEls = Array.from(document.querySelectorAll(".preview"));
+
+      const ROOM_ID = "default";
+      let ws;
+      let streams = [];
+      const peers = new Map(); // viewerId -> RTCPeerConnection
+      let starting = false;
+
+      function updateStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      function updateShareHint() {
+        const originHost = window.location.host;
+        shareInfoEl.textContent = `Viewer: http://${originHost}/viewer.html`;
+      }
+
+      async function getCameraStreams(max = 4) {
+        const results = [];
+        const usedIds = new Set();
+
+        // 1) Ambil kamera default dulu untuk memicu izin dan menangkap satu feed.
+        try {
+          const primary = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false,
+          });
+          results.push(primary);
+          const firstTrack = primary.getVideoTracks()[0];
+          const id = firstTrack?.getSettings()?.deviceId;
+          if (id) usedIds.add(id);
+        } catch (err) {
+          console.warn("Gagal kamera default", err);
+        }
+
+        // 2) Enumerasi setelah izin, lalu coba kamera lain yang berbeda deviceId.
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cams = devices.filter((d) => d.kind === "videoinput");
+        for (const cam of cams) {
+          if (usedIds.has(cam.deviceId)) continue;
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+              video: {
+                deviceId: { exact: cam.deviceId },
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+              },
+              audio: false,
+            });
+            results.push(stream);
+            const track = stream.getVideoTracks()[0];
+            const id = track?.getSettings()?.deviceId || cam.deviceId;
+            if (id) usedIds.add(id);
+            if (results.length >= max) break;
+          } catch (err) {
+            console.warn("Gagal akses kamera", cam.label || cam.deviceId, err);
+          }
+        }
+
+        if (!results.length) {
+          throw new Error("Tidak ada kamera yang bisa diakses");
+        }
+
+        return results.slice(0, max);
+      }
+
+      function showPreviews() {
+        previewEls.forEach((el, idx) => {
+          const stream = streams[idx];
+          el.srcObject = stream || null;
+          el.style.display = stream ? "block" : "none";
+        });
+      }
+
+      async function startBroadcast() {
+        if (starting) return;
+        starting = true;
+        updateShareHint();
+        try {
+          streams = await getCameraStreams(4);
+          showPreviews();
+          updateStatus(`Menyiarkan ${streams.length} kamera`);
+        } catch (err) {
+          updateStatus(`Tidak bisa akses kamera: ${err.message || err.name || err}`);
+          starting = false;
+          console.error(err);
+          return;
+        }
+        connectSocket();
+        starting = false;
+      }
+
+      function stopBroadcast() {
+        peers.forEach((pc) => pc.close());
+        peers.clear();
+        if (ws) {
+          ws.close();
+          ws = null;
+        }
+        streams.forEach((s) => s.getTracks().forEach((t) => t.stop()));
+        streams = [];
+        showPreviews();
+        updateStatus("Stopped");
+      }
+
+      function connectSocket() {
+        ws = new WebSocket(`ws://${window.location.host}/signal`);
+        ws.onopen = () => {
+          updateStatus(`Terhubung sebagai sender`);
+          ws.send(
+            JSON.stringify({ type: "register-sender", roomId: ROOM_ID })
+          );
+        };
+
+        ws.onmessage = async (event) => {
+          const msg = JSON.parse(event.data);
+          switch (msg.type) {
+            case "sender-registered":
+              updateStatus(`Menunggu viewer tersambung`);
+              break;
+            case "viewer-join":
+              updateStatus(`Viewer ${msg.viewerId} bergabung, menyiapkan koneksi...`);
+              break;
+            case "viewer-offer":
+              await handleViewerOffer(msg.viewerId, msg.sdp);
+              break;
+            case "viewer-ice-candidate":
+              await addIceCandidate(msg.viewerId, msg.candidate);
+              break;
+            case "viewer-left":
+              closePeer(msg.viewerId);
+              updateStatus(`Viewer ${msg.viewerId} keluar`);
+              break;
+            case "sender-disconnected":
+              // not used on sender
+              break;
+            default:
+              break;
+          }
+        };
+
+        ws.onclose = () => {
+          updateStatus("WebSocket terputus");
+        };
+      }
+
+      async function handleViewerOffer(viewerId, sdp) {
+        const pc = createPeerConnection(viewerId);
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        attachTracks(pc);
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws?.send(
+          JSON.stringify({
+            type: "sender-answer",
+            roomId: ROOM_ID,
+            viewerId,
+            sdp: pc.localDescription,
+          })
+        );
+      }
+
+      async function addIceCandidate(viewerId, candidate) {
+        if (!candidate) return;
+        const pc = peers.get(viewerId);
+        if (!pc) return;
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.error("Error adding ICE candidate", err);
+        }
+      }
+
+      function createPeerConnection(viewerId) {
+        if (peers.has(viewerId)) {
+          return peers.get(viewerId);
+        }
+        const pc = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+
+        attachTracks(pc);
+
+        pc.onicecandidate = (event) => {
+          if (event.candidate) {
+            ws?.send(
+              JSON.stringify({
+                type: "sender-ice-candidate",
+                roomId: ROOM_ID,
+                viewerId,
+                candidate: event.candidate,
+              })
+            );
+          }
+        };
+
+        pc.onconnectionstatechange = () => {
+          if (
+            pc.connectionState === "disconnected" ||
+            pc.connectionState === "failed" ||
+            pc.connectionState === "closed"
+          ) {
+            closePeer(viewerId);
+          }
+        };
+
+        peers.set(viewerId, pc);
+        return pc;
+      }
+
+      function attachTracks(pc) {
+        if (pc._tracksAdded) return;
+        streams.forEach((stream) => {
+          stream.getTracks().forEach((track) => {
+            const sender = pc.addTrack(track, stream);
+            try {
+              const params = sender.getParameters();
+              params.encodings = params.encodings || [{}];
+              params.encodings[0].maxBitrate = 2_000_000; // ~2 Mbps target
+              sender.setParameters(params);
+            } catch (err) {
+              console.warn("Gagal set bitrate", err);
+            }
+          });
+        });
+        pc._tracksAdded = true;
+      }
+
+      function closePeer(viewerId) {
+        const pc = peers.get(viewerId);
+        if (pc) {
+          pc.close();
+          peers.delete(viewerId);
+        }
+      }
+
+      window.addEventListener("load", () => {
+        // Mulai otomatis untuk mempermudah; browser akan tetap meminta izin kamera.
+        startBroadcast();
+      });
+      window.addEventListener("beforeunload", stopBroadcast);
+    </script>
+  </body>
+</html>

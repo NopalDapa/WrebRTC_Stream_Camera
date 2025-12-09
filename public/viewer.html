@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LAN WebRTC Viewer</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="page">
+      <h1>WebRTC Viewer</h1>
+      <div class="card">
+        <div class="row">
+          <div class="pill" id="status">Idle</div>
+          <div class="pill" id="viewerId"></div>
+        </div>
+        <div class="grid">
+          <video class="remote" autoplay playsinline controls></video>
+          <video class="remote" autoplay playsinline controls></video>
+          <video class="remote" autoplay playsinline controls></video>
+          <video class="remote" autoplay playsinline controls></video>
+        </div>
+        <div class="info">
+          Pastikan perangkat pengirim membuka halaman sender pada jaringan yang sama. Keduanya akan terhubung otomatis.
+        </div>
+      </div>
+    </div>
+    <script>
+      const statusEl = document.getElementById("status");
+      const viewerIdEl = document.getElementById("viewerId");
+      const remoteVideos = Array.from(document.querySelectorAll(".remote"));
+      const ROOM_ID = "default";
+
+      let viewerId =
+        (crypto.randomUUID && crypto.randomUUID()) ||
+        Math.random().toString(36).slice(2);
+      viewerIdEl.textContent = `Viewer ID: ${viewerId}`;
+
+      let ws;
+      let pc;
+      let transceivers = [];
+
+      function updateStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      function setupPeerConnection() {
+        pc = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+        transceivers = [];
+        for (let i = 0; i < 4; i++) {
+          const tx = pc.addTransceiver("video", { direction: "recvonly" });
+          transceivers.push(tx);
+        }
+
+        pc.onicecandidate = (event) => {
+          if (event.candidate) {
+            ws?.send(
+              JSON.stringify({
+                type: "viewer-ice-candidate",
+                roomId: ROOM_ID,
+                viewerId,
+                candidate: event.candidate,
+              })
+            );
+          }
+        };
+
+        pc.ontrack = (event) => {
+          const mid = event.transceiver?.mid;
+          let idx =
+            transceivers.findIndex((tx) => tx.mid === mid && mid !== null);
+          if (idx === -1) {
+            idx = remoteVideos.findIndex((v) => !v.srcObject);
+          }
+          if (idx === -1) idx = 0;
+          remoteVideos[idx].srcObject = event.streams[0];
+          remoteVideos[idx].style.display = "block";
+        };
+
+        pc.onconnectionstatechange = () => {
+          updateStatus(`Peer state: ${pc.connectionState}`);
+          if (
+            pc.connectionState === "disconnected" ||
+            pc.connectionState === "failed" ||
+            pc.connectionState === "closed"
+          ) {
+            stopViewing();
+          }
+        };
+      }
+
+      async function makeOffer() {
+        if (!pc) setupPeerConnection();
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        ws?.send(
+          JSON.stringify({
+            type: "viewer-offer",
+            roomId: ROOM_ID,
+            viewerId,
+            sdp: pc.localDescription,
+          })
+        );
+        updateStatus("Offer dikirim, menunggu jawaban sender...");
+      }
+
+      function startViewing() {
+        if (ws || pc) return;
+        ws = new WebSocket(`ws://${window.location.host}/signal`);
+        ws.onopen = () => {
+          ws.send(
+            JSON.stringify({ type: "viewer-join", roomId: ROOM_ID, viewerId })
+          );
+        };
+        ws.onmessage = async (event) => {
+          const msg = JSON.parse(event.data);
+          switch (msg.type) {
+            case "viewer-registered":
+              updateStatus(
+                msg.senderOnline
+                  ? "Sender online, membuat offer..."
+                  : "Menunggu sender online..."
+              );
+              makeOffer();
+              break;
+            case "sender-available":
+              updateStatus("Sender online, membuat offer...");
+              makeOffer();
+              break;
+            case "sender-answer":
+              if (!pc) setupPeerConnection();
+              await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+              updateStatus("Terhubung. Memutar stream...");
+              break;
+            case "sender-ice-candidate":
+              if (pc && msg.candidate) {
+                try {
+                  await pc.addIceCandidate(
+                    new RTCIceCandidate(msg.candidate)
+                  );
+                } catch (err) {
+                  console.error("Error add ICE", err);
+                }
+              }
+              break;
+            case "sender-disconnected":
+              updateStatus("Sender offline");
+              stopViewing();
+              break;
+            default:
+              break;
+          }
+        };
+        ws.onclose = () => updateStatus("WebSocket terputus");
+      }
+
+      function stopViewing() {
+        if (pc) {
+          pc.close();
+          pc = null;
+        }
+        if (ws) {
+          ws.close();
+          ws = null;
+        }
+        remoteVideos.forEach((v) => {
+          v.srcObject = null;
+          v.style.display = "none";
+        });
+        updateStatus("Stopped");
+      }
+
+      window.addEventListener("load", () => {
+        // Mulai otomatis untuk mempermudah akses viewer.
+        startViewing();
+      });
+      window.addEventListener("beforeunload", stopViewing);
+    </script>
+  </body>
+</html>
